@@ -18,7 +18,7 @@ class OrderIntent:
     side: Literal["Buy", "Sell"]
     abs_notional: float  # USD notional (absolute value)
     urgency: Literal["Normal", "High"] = "Normal"
-    style: Literal["ALO", "TWAP", "IOC"] = "ALO"
+    style: Literal["ALO", "TWAP", "IOC", "Market"] = "ALO"
     reduce_only: bool = False
     
     # TP/SL (optional)

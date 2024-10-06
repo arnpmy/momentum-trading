@@ -1,0 +1,79 @@
+# Mainnet Test Config - Balanced risk for testing with real capital
+# More aggressive than production, but still reasonable
+
+universe:
+  min_day_notional: 10_000_000.0  # $10M minimum (mainnet liquid assets)
+  min_open_interest: 5_000_000.0  # $5M minimum OI
+  top_n: 8  # Smaller universe for $400 capital (8 positions × $50 avg = $400)
+  ranking_method: product
+
+bars:
+  interval: "4h"
+  rebalance_at: "+5min"  # 5 minutes after bar close
+
+signal:
+  lookbacks: [24, 96, 240]  # 24h, 96h (4d), 240h (10d) in 4h bars
+  zscore_window_bars: 360  # ~60 days of 4h bars
+  clip_min: -2.0
+  clip_max: 2.0
+  epsilon: 1e-9
+
+funding:
+  lambda_penalty: 1.0
+  holding_hours: 4  # 4h hold on average
+  directional: true
+
+risk:
+  vol_target_annual: 0.30  # 30% annual vol (moderate-aggressive for $400)
+  w_max: 0.15  # 15% max per asset (allows $60 positions on $400)
+  sigma_min: 0.01
+  
+  beta_neutral_enabled: false
+  beta_lookback_days: 60
+  
+  cov_method: ledoit_wolf  # Robust covariance
+  ewma_halflife: 60
+
+liquidity:
+  max_pct_24h_vol: 0.005  # 0.5% of daily volume
+  max_pct_oi: 0.02  # 2% of OI
+
+stops:
+  atr_multiple: 2.0  # Tighter stops for 4h
+  atr_period: 14
+
+trade_gate:
+  min_edge_to_cost_ratio: 2.5  # Balanced (between prod 3.0 and test 2.0)
+  maker_fee_bps: 0.15
+  taker_fee_bps: 4.5
+  slippage_model: l2_depth
+  fixed_slippage_bps: 2.0
+
+execution:
+  default_style: ALO  # Maker-first (earn rebates)
+  alo_refresh_sec: 10
+  twap_enabled: true
+  twap_total_minutes: 8
+  twap_threshold_usd: 50_000.0
+  enforce_sigfigs: true
+  max_decimals: 6
+
+precision:
+  enforce_sigfigs: true
+  max_sig_figs: 5
+  max_decimals: 6
+
+kill_switch:
+  daily_loss_pct: 0.03  # 3% daily loss cap (more lenient than prod 2%)
+  ws_heartbeat_misses: 5
+  slip_ceiling_bps: 100.0
+  max_api_errors: 15  # Slightly more lenient
+
+monitoring:
+  log_level: INFO
+  log_dir: logs
+  metrics_enabled: true
+  alert_on_kill_switch: true
+
+hyperliquid:
+  network: mainnet  # Real mainnet execution

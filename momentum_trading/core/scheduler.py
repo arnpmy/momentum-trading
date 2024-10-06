@@ -8,6 +8,7 @@ Handles funding-hour boundaries and prevents rebalance overlap.
 import time
 from datetime import datetime, timezone
 from typing import Callable
+from datetime import timedelta
 
 from momentum_trading.core.config import Config
 
@@ -51,7 +52,6 @@ class Scheduler:
             target = now.replace(hour=0, minute=5, second=0, microsecond=0)
             if now >= target:
                 # Already past today's rebalance, schedule tomorrow
-                from datetime import timedelta
                 target += timedelta(days=1)
             return target
         
@@ -70,7 +70,6 @@ class Scheduler:
             
             if next_hour is None:
                 # Wrap to tomorrow 00:05
-                from datetime import timedelta
                 target = now.replace(hour=0, minute=5, second=0, microsecond=0)
                 target += timedelta(days=1)
             else:
@@ -78,8 +77,40 @@ class Scheduler:
             
             return target
         
+        elif self.config.bars.interval == "1h":
+            # Every hour at :05 past the hour
+            target = now.replace(minute=5, second=0, microsecond=0)
+            if now.minute >= 5:
+                # Already past this hour's rebalance, schedule next hour
+                target += timedelta(hours=1)
+            return target
+        
         else:
-            raise ValueError(f"Unsupported interval: {self.config.bars.interval}")
+            # Generic interval support (e.g., "5m", "15m")
+            # Parse interval to minutes
+            interval_minutes = self._parse_interval_minutes(self.config.bars.interval)
+            if interval_minutes <= 0:
+                raise ValueError(f"Unsupported interval: {self.config.bars.interval}")
+            
+            # Round to next interval boundary + 5 minutes
+            total_minutes = now.hour * 60 + now.minute
+            next_boundary = ((total_minutes // interval_minutes) + 1) * interval_minutes
+            next_boundary_with_offset = next_boundary + 5
+            
+            target = now.replace(second=0, microsecond=0)
+            target += timedelta(minutes=(next_boundary_with_offset - total_minutes))
+            
+            return target
+    
+    def _parse_interval_minutes(self, interval: str) -> int:
+        """Parse interval string to minutes (e.g., '5m' -> 5, '1h' -> 60)."""
+        if interval.endswith("m"):
+            return int(interval[:-1])
+        elif interval.endswith("h"):
+            return int(interval[:-1]) * 60
+        elif interval.endswith("d"):
+            return int(interval[:-1]) * 1440
+        return 0
     
     def seconds_until_next_rebalance(self) -> float:
         """Calculate seconds until next rebalance."""

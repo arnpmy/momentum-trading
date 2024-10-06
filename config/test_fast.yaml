@@ -1,0 +1,81 @@
+# Test Fast Config - 1h intervals for rapid testing
+# DO NOT use in production
+
+universe:
+  min_day_notional: 0.0  # Testnet has very low volume (~$1M max)
+  min_open_interest: 0.0  # Accept all assets with any OI
+  top_n: 20  # Take top 20 by volume×OI score
+  ranking_method: product
+
+bars:
+  interval: "1h"
+  rebalance_at: "+5min"  # 5 minutes after bar close
+
+signal:
+  lookbacks: [6, 24, 72]  # 6h, 24h (1d), 72h (3d) in 1h bars
+  zscore_window_bars: 120  # ~5 days of 1h bars (reduce for testnet)
+  clip_min: -2.0
+  clip_max: 2.0
+  epsilon: 1e-9
+
+funding:
+  lambda_penalty: 1.0
+  holding_hours: 1  # 1h hold on average
+  directional: true
+
+risk:
+  vol_target_annual: 0.50  # Higher target for testing with small capital (50%)
+  w_max: 0.20  # Allow larger per-asset positions (20%)
+  sigma_min: 0.01
+  
+  beta_neutral_enabled: false
+  beta_lookback_days: 30  # Shorter for testing
+  
+  cov_method: sample  # Faster than Ledoit-Wolf for testing
+  ewma_halflife: 30
+
+liquidity:
+  max_pct_24h_vol: 0.005
+  max_pct_oi: 0.02
+
+stops:
+  atr_multiple: 2.0  # Tighter stops for 1h
+  atr_period: 14
+
+trade_gate:
+  min_edge_to_cost_ratio: 2.0  # Lower bar for testing
+  maker_fee_bps: 0.15
+  taker_fee_bps: 4.5
+  slippage_model: fixed  # Faster for testing
+  fixed_slippage_bps: 3.0
+
+execution:
+  default_style: Market  # Use market orders for instant fills in testing
+  alo_refresh_sec: 5  # Faster requote for testing
+  twap_enabled: true
+  twap_total_minutes: 3  # Shorter TWAP for testing
+  twap_threshold_usd: 25_000.0  # Lower threshold
+  enforce_sigfigs: true
+  max_decimals: 6
+
+precision:
+  enforce_sigfigs: true
+  max_sig_figs: 5
+  max_decimals: 6
+
+kill_switch:
+  daily_loss_pct: 0.05  # More lenient for testing (5%)
+  ws_heartbeat_misses: 5
+  slip_ceiling_bps: 150.0
+  max_api_errors: 20  # More lenient for testing
+
+monitoring:
+  log_level: DEBUG  # Verbose for testing
+  log_dir: logs
+  metrics_enabled: true
+  alert_on_kill_switch: true
+
+hyperliquid:
+  network: testnet  # Execute on testnet
+  data_network: mainnet  # Use mainnet data (real liquidity/signals)
+

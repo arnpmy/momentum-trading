@@ -96,6 +96,7 @@ class TradeGateConfig:
 class ExecutionConfig:
     """Execution routing parameters."""
     
+    default_style: Literal["ALO", "IOC", "Market"] = "ALO"  # Default order style
     alo_refresh_sec: int = 10  # Requote ALO after N seconds if unfilled
     twap_enabled: bool = True
     twap_total_minutes: int = 8  # TWAP duration for large orders
@@ -140,12 +141,15 @@ class HyperliquidConfig:
     """Hyperliquid-specific settings."""
     
     network: Literal["testnet", "mainnet"] = "testnet"
+    data_network: str = ""  # Optional: use different network for data (e.g., "mainnet" data with "testnet" execution)
     address: str = ""  # Main wallet address (from env)
     secret_key: str = ""  # API wallet private key (from env)
+    vault_address: str = ""  # Optional: vault address to trade on behalf of (from env)
     
     # API endpoints (auto-set by network)
     api_url: str = ""
     ws_url: str = ""
+    data_api_url: str = ""  # API URL for data (if different from execution)
     
     def __post_init__(self):
         """Set API URLs based on network."""
@@ -157,6 +161,17 @@ class HyperliquidConfig:
         else:
             self.api_url = constants.MAINNET_API_URL
             self.ws_url = constants.MAINNET_API_URL.replace("http", "ws")
+        
+        # Set data API URL (defaults to same as execution network)
+        if self.data_network:
+            if self.data_network == "testnet":
+                self.data_api_url = constants.TESTNET_API_URL
+            elif self.data_network == "mainnet":
+                self.data_api_url = constants.MAINNET_API_URL
+            else:
+                self.data_api_url = self.api_url
+        else:
+            self.data_api_url = self.api_url
 
 
 @dataclass
@@ -197,6 +212,9 @@ class Config:
         
         if os.getenv("HL_SECRET_KEY"):
             self.hyperliquid.secret_key = os.getenv("HL_SECRET_KEY", "")
+        
+        if os.getenv("HL_VAULT_ADDRESS"):
+            self.hyperliquid.vault_address = os.getenv("HL_VAULT_ADDRESS", "")
         
         # Re-initialize to set API URLs
         self.hyperliquid.__post_init__()
@@ -264,15 +282,15 @@ class Config:
         if not self.hyperliquid.secret_key:
             errors.append("HL_SECRET_KEY environment variable required")
         
-        # Validate ranges
+        # Validate ranges (relaxed for testing)
         if not (0.5 <= self.funding.lambda_penalty <= 1.5):
             errors.append("funding.lambda_penalty must be in [0.5, 1.5]")
         
-        if not (0.10 <= self.risk.vol_target_annual <= 0.30):
-            errors.append("risk.vol_target_annual should be in [0.10, 0.30]")
+        if not (0.05 <= self.risk.vol_target_annual <= 1.0):
+            errors.append("risk.vol_target_annual should be in [0.05, 1.0] (testing allows up to 100%)")
         
-        if not (0.03 <= self.risk.w_max <= 0.10):
-            errors.append("risk.w_max should be in [0.03, 0.10]")
+        if not (0.01 <= self.risk.w_max <= 0.50):
+            errors.append("risk.w_max should be in [0.01, 0.50] (testing allows up to 50%)")
         
         if self.trade_gate.min_edge_to_cost_ratio < 1.0:
             errors.append("trade_gate.min_edge_to_cost_ratio must be >= 1.0")

@@ -11,6 +11,8 @@ from pathlib import Path
 import time
 import hashlib
 from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
 
 from eth_account import Account
 from hyperliquid.info import Info
@@ -22,6 +24,7 @@ from momentum_trading.data.loader import MarketDataLoader
 from momentum_trading.signals.engine import SignalEngine
 from momentum_trading.risk.engine import RiskEngine
 from momentum_trading.execution.router import ExecutionRouter
+from momentum_trading.execution.orders import OrderIntent, ExecutionReport
 from momentum_trading.monitoring.metrics import MetricsCollector
 from momentum_trading.monitoring.kill_switch import KillSwitch
 from momentum_trading.utils.state_store import StateStore
@@ -53,16 +56,34 @@ class MomentumTradingSystem:
         
         print(f"[Init] Starting {config.hyperliquid.network} trading system")
         
-        # Initialize Hyperliquid clients
-        self.info = Info(config.hyperliquid.api_url, skip_ws=True)
+        # Initialize Hyperliquid clients (with retry for rate limits)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.info = Info(config.hyperliquid.api_url, skip_ws=True)
+                
+                # Create LocalAccount from private key for Exchange
+                wallet = Account.from_key(config.hyperliquid.secret_key)
+                vault_address = config.hyperliquid.vault_address if config.hyperliquid.vault_address else None
+                self.exchange = Exchange(wallet, config.hyperliquid.api_url, vault_address=vault_address)
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < max_retries:
+                    wait = 5 * attempt
+                    print(f"[Init] Rate limited, retrying in {wait}s... (attempt {attempt}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    raise
         
-        # Create LocalAccount from private key for Exchange
-        wallet = Account.from_key(config.hyperliquid.secret_key)
-        self.exchange = Exchange(wallet, config.hyperliquid.api_url)
-        
-        # Initialize components
-        self.data_loader = MarketDataLoader(config)
-        self.signal_engine = SignalEngine(config, self.data_loader)
+        # Initialize components (use data_api_url for market data if configured)
+        data_config = Config()
+        data_config.__dict__.update(config.__dict__)
+        if config.hyperliquid.data_api_url != config.hyperliquid.api_url:
+            # Override data loader to use data_api_url
+            print(f"[Init] Using {config.hyperliquid.data_network or 'configured'} network for data")
+            data_config.hyperliquid.api_url = config.hyperliquid.data_api_url
+        self.data_loader = MarketDataLoader(data_config)
+        self.signal_engine = SignalEngine(data_config, self.data_loader)
         self.risk_engine = RiskEngine(config, self.data_loader)
         self.execution_router = ExecutionRouter(config, self.exchange, self.info, dry_run=dry_run)
         self.metrics = MetricsCollector(config)
@@ -116,17 +137,19 @@ class MomentumTradingSystem:
                 for i in range(len(asset_ctxs))
             }
             
-            # Get account state
-            clearinghouse = self.info.clearinghouse_state(self.config.hyperliquid.address)
-            equity = float(clearinghouse["marginSummary"]["accountValue"])
-            print(f"[Rebalance]   Equity: ${equity:,.2f}")
+            # Get account state (vault if configured, else personal account)
+            query_address = self.config.hyperliquid.vault_address if self.config.hyperliquid.vault_address else self.config.hyperliquid.address
+            user_state = self.info.user_state(query_address)
+            equity = float(user_state["marginSummary"]["accountValue"])
+            account_type = "vault" if self.config.hyperliquid.vault_address else "personal"
+            print(f"[Rebalance]   Equity ({account_type}): ${equity:,.2f}")
             # Cache equity for intent conversion later
             self._account_equity_cache = equity
             
             # Current positions
             current_positions = {
                 ap["position"]["coin"]: float(ap["position"]["szi"])
-                for ap in clearinghouse.get("assetPositions", [])
+                for ap in user_state.get("assetPositions", [])
             }
             
             # Step 3: Compute signals
@@ -138,8 +161,6 @@ class MomentumTradingSystem:
             print("[Rebalance] Step 4: Computing target weights...")
             # Build returns DataFrame (fast placeholder: use signal interval closes)
             # In production, persist returns and maintain a rolling matrix.
-            import pandas as pd
-            import time
             now_ms = int(time.time() * 1000)
             interval = self.config.bars.interval
             interval_ms = {"1d": 86_400_000, "4h": 14_400_000, "1h": 3_600_000}.get(interval, 86_400_000)
@@ -153,7 +174,6 @@ class MomentumTradingSystem:
                     cs.sort(key=lambda x: x["t"])
                     closes = [k["c"] for k in cs]
                     if len(closes) > 2:
-                        import numpy as np
                         r = np.diff(np.log(np.array(closes)))
                         rets[c] = r
                 except Exception:
@@ -184,6 +204,23 @@ class MomentumTradingSystem:
             
             # Step 6: Update state & metrics
             print("[Rebalance] Step 6: Updating state...")
+            
+            # Persist equity
+            self.state_store.append_jsonl("equity", {"t": time.time(), "equity": equity})
+            
+            # Persist execution reports (orders placed)
+            for rep in execution_reports:
+                self.state_store.append_jsonl("orders", {
+                    "t": time.time(),
+                    "oid": rep.oid,
+                    "cloid": rep.cloid,
+                    "status": rep.status,
+                    "filled_sz": rep.filled_sz,
+                    "avg_px": rep.avg_px,
+                    "fees": rep.fees,
+                })
+            
+            # Snapshot
             self.state_store.save_snapshot("rebalance", {
                 "equity": equity,
                 "n_assets": len(universe),
@@ -191,8 +228,18 @@ class MomentumTradingSystem:
                 "n_trades": len(execution_reports),
             })
             
+            # Collect metrics
+            edge_ratios = [tw.edge / max(tw.friction, 1e-9) for tw in target_weights.values()]
+            for ratio in edge_ratios:
+                self.metrics.record_edge_friction(ratio)
+            
+            metrics = {
+                "edge_to_friction": edge_ratios,
+                "api_errors": self.execution_router.api_error_count,
+                "equity": equity,
+            }
+            
             # Check kill switch conditions
-            metrics = {"edge_to_friction": [tw.edge / max(tw.friction, 1e-9) for tw in target_weights.values()]}
             if self.kill_switch.check(metrics):
                 self.kill_switch.trigger("Metrics threshold breached")
             
@@ -213,18 +260,32 @@ class MomentumTradingSystem:
         if equity is None:
             return intents
         twap_threshold = self.config.execution.twap_threshold_usd
+        min_order_value = 10.0  # Hyperliquid minimum order value
+        
+        print(f"[Intents] Converting {len(target_weights)} weights to intents (equity=${equity:.2f})")
+        
         for coin, tw in target_weights.items():
             cur_qty = float(current_positions.get(coin, 0.0))
             mid_px = float(ctx_by_coin.get(coin, {}).get("midPx", 0.0))
             if mid_px <= 0:
+                print(f"[Intents] Skipping {coin}: no mid price")
                 continue
             target_notional = tw.w_scaled * equity
             current_notional = cur_qty * mid_px
             delta = target_notional - current_notional
-            if abs(delta) <= 0:
+            
+            print(f"[Intents] {coin}: target=${target_notional:.2f}, current=${current_notional:.2f}, delta=${delta:.2f}")
+            
+            # Skip if delta is too small (below exchange minimum)
+            if abs(delta) < min_order_value:
+                print(f"[Intents] Skipping {coin}: delta ${abs(delta):.2f} < ${min_order_value:.2f} minimum")
                 continue
             side = "Buy" if delta > 0 else "Sell"
-            style = "TWAP" if abs(delta) > twap_threshold and self.config.execution.twap_enabled else "ALO"
+            # Choose style: TWAP for large, else config default (ALO/IOC/Market)
+            if abs(delta) > twap_threshold and self.config.execution.twap_enabled:
+                style = "TWAP"
+            else:
+                style = self.config.execution.default_style
             # Reduce-only if delta reduces existing exposure without flipping
             reduce_only = False
             if cur_qty != 0:
@@ -253,6 +314,15 @@ class MomentumTradingSystem:
     
     def run(self):
         """Run the trading system (blocks indefinitely)."""
+        # Should this be there for prod?
+        print("[Main] Running initial rebalance...")
+        try:
+            self.rebalance()
+        except Exception as e:
+            print(f"[Main] Initial rebalance failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
         print("[Main] Starting scheduler...")
         try:
             self.scheduler.run_forever()

@@ -12,6 +12,7 @@ import hashlib
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import signing
+from hyperliquid.utils.types import Cloid
 
 from momentum_trading.core.config import Config
 from momentum_trading.execution.orders import OrderIntent, ExecutionReport
@@ -123,6 +124,8 @@ class ExecutionRouter:
                     rep = self._route_alo(intent, reduce_only)
                 elif intent.style == "TWAP":
                     rep = self._route_twap(intent, reduce_only)
+                elif intent.style == "Market":
+                    rep = self._route_market(intent, reduce_only)
                 else:
                     rep = self._route_ioc(intent, reduce_only)
                 reports.append(rep)
@@ -139,24 +142,70 @@ class ExecutionRouter:
             # Determine price and size
             best_bid, best_ask, mid = self._best_prices(coin)
             if mid <= 0:
-                return ExecutionReport(status="rejected", error_code="no_price", error_msg="No price available")
+                err_msg = f"No price available for {coin}"
+                print(f"[ExecutionRouter] ALO rejected: {err_msg}")
+                return ExecutionReport(status="rejected", error_code="no_price", error_msg=err_msg)
             # Place at best bid/ask to avoid crossing
             raw_px = best_bid if is_buy else best_ask
+            if raw_px <= 0:
+                err_msg = f"Invalid best price for {coin}: bid={best_bid}, ask={best_ask}"
+                print(f"[ExecutionRouter] ALO rejected: {err_msg}")
+                return ExecutionReport(status="rejected", error_code="no_price", error_msg=err_msg)
             sz_dec = self.asset_map.get(coin, {}).get("szDecimals", 0)
             price_str = format_price(raw_px, sz_dec, self.config.precision.max_decimals)
             px = float(price_str)
             sz = self._size_from_notional(coin, intent.abs_notional, px)
             if sz <= 0:
-                return ExecutionReport(status="rejected", error_code="zero_size")
+                err_msg = f"Zero size for {coin}: notional=${intent.abs_notional:.2f}, px={px}"
+                print(f"[ExecutionRouter] ALO rejected: {err_msg}")
+                return ExecutionReport(status="rejected", error_code="zero_size", error_msg=err_msg)
             # Build order type: limit ALO
             order_type: signing.OrderType = {"limit": {"tif": "Alo"}}  # type: ignore[assignment]
             cloid = self._make_cloid(coin, is_buy, sz, px, order_type, reduce_only)
             if not self.dry_run:
+                print(f"[ExecutionRouter] Placing ALO: {coin} {intent.side} {sz} @ {px} (reduce_only={reduce_only})")
                 resp = self._with_retries(self.exchange.order, coin, is_buy, sz, px, order_type, reduce_only, cloid)
+                print(f"[ExecutionRouter] ALO response: {resp}")
             # Minimal report
             return ExecutionReport(status="pending", maker_ratio=1.0)
         except Exception as e:
+            err_msg = f"{coin} ALO error: {e}"
+            print(f"[ExecutionRouter] {err_msg}")
+            import traceback
+            traceback.print_exc()
             return ExecutionReport(status="rejected", error_code="alo_error", error_msg=str(e))
+    
+    def _route_market(self, intent: OrderIntent, reduce_only: bool) -> ExecutionReport:
+        """Place market order for instant execution."""
+        try:
+            coin = intent.coin
+            is_buy = intent.side == "Buy"
+            best_bid, best_ask, mid = self._best_prices(coin)
+            px = mid if mid > 0 else (best_bid if is_buy else best_ask)
+            if px <= 0:
+                err_msg = f"No price for {coin}"
+                print(f"[ExecutionRouter] Market rejected: {err_msg}")
+                return ExecutionReport(status="rejected", error_code="no_price", error_msg=err_msg)
+            sz = self._size_from_notional(coin, intent.abs_notional, px)
+            if sz <= 0:
+                err_msg = f"Zero size for {coin}: notional=${intent.abs_notional:.2f}, px={px}"
+                print(f"[ExecutionRouter] Market rejected: {err_msg}")
+                return ExecutionReport(status="rejected", error_code="zero_size", error_msg=err_msg)
+            
+            if not self.dry_run:
+                print(f"[ExecutionRouter] Placing Market: {coin} {intent.side} {sz} @ ~{px} (reduce_only={reduce_only})")
+                if reduce_only:
+                    resp = self._with_retries(self.exchange.market_close, coin, sz)
+                else:
+                    resp = self._with_retries(self.exchange.market_open, coin, is_buy, sz, px, 0.05)
+                print(f"[ExecutionRouter] Market response: {resp}")
+            return ExecutionReport(status="filled", maker_ratio=0.0)
+        except Exception as e:
+            err_msg = f"{coin} Market error: {e}"
+            print(f"[ExecutionRouter] {err_msg}")
+            import traceback
+            traceback.print_exc()
+            return ExecutionReport(status="rejected", error_code="market_error", error_msg=str(e))
     
     def _route_twap(self, intent: OrderIntent, reduce_only: bool) -> ExecutionReport:
         """Place TWAP order (30s slices, 3% max slippage)."""
@@ -256,13 +305,34 @@ class ExecutionRouter:
         """Get best bid/ask and mid price from L2 snapshot."""
         if not self.info:
             return 0.0, 0.0, 0.0
-        book = self.info.l2_snapshot(coin)
-        bids = book.get("bids") or (book.get("levels", [[], []])[0] if book.get("levels") else [])
-        asks = book.get("asks") or (book.get("levels", [[], []])[1] if book.get("levels") else [])
-        best_bid = float(bids[0][0]) if bids else 0.0
-        best_ask = float(asks[0][0]) if asks else 0.0
-        mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
-        return best_bid, best_ask, mid
+        try:
+            book = self.info.l2_snapshot(coin)
+            # Handle different response formats
+            if isinstance(book, dict):
+                levels = book.get("levels")
+                if isinstance(levels, list) and len(levels) >= 2:
+                    bids, asks = levels[0], levels[1]
+                else:
+                    bids = book.get("bids", [])
+                    asks = book.get("asks", [])
+            else:
+                bids, asks = [], []
+            
+            # Extract best bid/ask (handle dict or list format)
+            def get_px(level):
+                if isinstance(level, dict):
+                    return float(level.get("px") or level.get("price") or 0)
+                elif isinstance(level, list) and len(level) >= 1:
+                    return float(level[0])
+                return 0.0
+            
+            best_bid = get_px(bids[0]) if bids and len(bids) > 0 else 0.0
+            best_ask = get_px(asks[0]) if asks and len(asks) > 0 else 0.0
+            mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
+            return best_bid, best_ask, mid
+        except Exception as e:
+            print(f"[ExecutionRouter] _best_prices failed for {coin}: {e}")
+            return 0.0, 0.0, 0.0
 
     def _size_from_notional(self, coin: str, abs_notional: float, px: float) -> float:
         """Convert USD notional to contract size, respecting szDecimals."""
@@ -276,10 +346,11 @@ class ExecutionRouter:
         except Exception:
             return 0.0
 
-    def _make_cloid(self, coin: str, is_buy: bool, sz: float, px: float, order_type: signing.OrderType, reduce_only: bool) -> str:
+    def _make_cloid(self, coin: str, is_buy: bool, sz: float, px: float, order_type: signing.OrderType, reduce_only: bool) -> Cloid:
         """Create deterministic client order id for idempotency per cycle."""
         base = f"{self.cycle_id or ''}|{coin}|{int(is_buy)}|{reduce_only}|{round(sz,8)}|{round(px,8)}|{order_type}"
-        return hashlib.sha256(base.encode()).hexdigest()[:32]
+        cloid_hex = hashlib.sha256(base.encode()).hexdigest()[:32]  # 32 hex chars = 16 bytes
+        return Cloid.from_str("0x" + cloid_hex)
 
     def _with_retries(self, func, *args, **kwargs):
         """Call exchange function with retries/backoff and error tracking."""

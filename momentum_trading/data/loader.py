@@ -6,6 +6,7 @@ Enforces pagination caps (5k bars), retry/backoff, and cache TTLs.
 """
 
 from typing import List, Dict, Tuple, Any
+import time
 
 from hyperliquid.info import Info
 from momentum_trading.core.config import Config
@@ -33,6 +34,9 @@ class MarketDataLoader:
         self.config = config
         self.info = Info(config.hyperliquid.api_url, skip_ws=True)
         self._cache: Dict = {}
+        self._candle_cache: Dict[str, List[Dict]] = {}  # Cache candles to avoid rate limits
+        self._cache_ttl: float = 300.0  # 5 min TTL
+        self._last_cache_time: float = 0.0
 
     # ------------------------
     # Internal helpers
@@ -88,6 +92,8 @@ class MarketDataLoader:
         # Extract per-asset fields aligned by index
         universe_list: List[Dict[str, Any]] = meta.get("universe", [])
         coins: List[str] = [u.get("name") for u in universe_list]
+        
+        print(f"[Universe] Total assets from meta: {len(coins)}")
 
         day_notional: List[float] = []
         open_interest: List[float] = []
@@ -107,12 +113,17 @@ class MarketDataLoader:
             if coin is None:
                 continue
             if mid_price[i] <= 0:
+                print(f"[Universe] Skipping {coin}: midPx={mid_price[i]}")
                 continue
             if day_notional[i] < self.config.universe.min_day_notional:
+                print(f"[Universe] Skipping {coin}: dayNtlVlm=${day_notional[i]:,.0f} < ${self.config.universe.min_day_notional:,.0f}")
                 continue
             if open_interest[i] < self.config.universe.min_open_interest:
+                print(f"[Universe] Skipping {coin}: OI=${open_interest[i]:,.0f} < ${self.config.universe.min_open_interest:,.0f}")
                 continue
             filtered_indices.append(i)
+        
+        print(f"[Universe] Filtered to {len(filtered_indices)} assets passing thresholds")
 
         # Ranking score
         if self.config.universe.ranking_method == "product":
@@ -137,7 +148,7 @@ class MarketDataLoader:
         end_ms: int
     ) -> List[Dict]:
         """
-        Fetch candle data for a coin using SDK.
+        Fetch candle data for a coin using SDK with caching to avoid rate limits.
         
         Args:
             coin: Asset name
@@ -148,6 +159,18 @@ class MarketDataLoader:
         Returns:
             List of candles with keys: t, o, h, l, c, v, n
         """
+        # Check cache first
+        cache_key = f"{coin}|{interval}|{start_ms}|{end_ms}"
+        now = time.time()
+        if cache_key in self._candle_cache and (now - self._last_cache_time) < self._cache_ttl:
+            return self._candle_cache[cache_key]
+        
+        # Rate limit: simple sleep between requests
+        if hasattr(self, "_last_request_time"):
+            elapsed = now - self._last_request_time
+            if elapsed < 0.5:  # Min 500ms between requests (more conservative)
+                time.sleep(0.5 - elapsed)
+        
         # SDK method: candles_snapshot(coin, interval, startTime, endTime)
         # Paginate by time range to respect ≤5000 bars per request
         interval_ms = self._interval_to_ms(interval)
@@ -156,7 +179,26 @@ class MarketDataLoader:
         end = int(end_ms)
 
         while next_start < end:
-            resp = self.info.candles_snapshot(coin, interval, next_start, end)
+            try:
+                resp = self.info.candles_snapshot(coin, interval, next_start, end)
+                self._last_request_time = time.time()
+            except Exception as e:
+                # Handle 429 or other errors
+                if "429" in str(e):
+                    print(f"[DataLoader] Rate limited on {coin}, sleeping 5s...")
+                    time.sleep(5.0)
+                    try:
+                        resp = self.info.candles_snapshot(coin, interval, next_start, end)
+                        self._last_request_time = time.time()
+                    except Exception as e2:
+                        if "429" in str(e2):
+                            # Still rate limited; return cached or empty
+                            print(f"[DataLoader] Still rate limited on {coin}, skipping")
+                            return self._candle_cache.get(cache_key, [])
+                        raise
+                else:
+                    raise
+            
             # SDK returns list of candles or wrapped dict
             candles = resp if isinstance(resp, list) else resp.get("candles", [])
             if not candles:
@@ -198,6 +240,10 @@ class MarketDataLoader:
             if len(normalized) < 2 and last_t <= next_start - interval_ms:
                 break
 
+        # Cache result
+        self._candle_cache[cache_key] = all_candles
+        self._last_cache_time = time.time()
+        
         return all_candles
     
     def get_funding_history(

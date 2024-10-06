@@ -191,11 +191,11 @@ class SignalEngine:
         if len(window_slice) < 2:
             return 0.0
         
-        mu = np.mean(window_slice)
-        sigma = np.std(window_slice, ddof=1)
+        mu = float(np.mean(window_slice))
+        sigma = float(np.std(window_slice, ddof=1))
         
         # Z-score with epsilon guard
-        epsilon = self.config.signal.epsilon
+        epsilon = float(self.config.signal.epsilon)
         z = (r[-1] - mu) / max(sigma, epsilon)
         
         return float(z)

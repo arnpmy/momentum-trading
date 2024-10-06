@@ -50,6 +50,7 @@ trade_gate:
   fixed_slippage_bps: 2.0
 
 execution:
+  default_style: ALO  # Maker-first for production (earn rebates)
   alo_refresh_sec: 10
   twap_enabled: true
   twap_total_minutes: 8
